@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Threading;
 using NLog;
@@ -31,6 +32,7 @@ namespace NpcFactionFixer
         private static NpcFactionFixer Instance { get; set; }
         private readonly HashSet<ulong> _connecting = new HashSet<ulong>();
         private IMultiplayerManagerBase _multiBase;
+        private static List<long> _realPlayerIds = new List<long>();
 
 
         public override void Init(ITorchBase torch)
@@ -120,12 +122,14 @@ namespace NpcFactionFixer
                     MyEntities.OnEntityAdd += MyEntitiesOnOnEntityAdd;
 
                     MySession.Static.Factions.OnPlayerJoined += Factions_OnPlayerJoined;
-                    var fixCount = CleanupPlayerFaction();
+                    var fixCount = CleanupPlayerFaction() + CleanupFaction();
                     if (fixCount == 0) break;
                     Log.Warn($"Cleaned up {fixCount} invalid faction data");
                     break;
                 case TorchSessionState.Unloading:
-                    CleanupPlayerFaction();
+                    var fixCountUnloading = CleanupPlayerFaction() + CleanupFaction();
+                    if (fixCountUnloading == 0) break;
+                    Log.Warn($"Cleaned up {fixCountUnloading} invalid faction data");
                     break;
                 case TorchSessionState.Unloaded:
                     break;
@@ -146,25 +150,31 @@ namespace NpcFactionFixer
         private static void KickPlayer(long id, MyFaction faction)
         {
             if (faction == null)return;
-            if (!MySession.Static.Players.TryGetPlayerId(id, out var playerId))
-            {
-                return;
-            }
+            
+            //Disabled cause it was keeping some players from being removed from faction
+            // if (!MySession.Static.Players.TryGetPlayerId(id, out var playerId))
+            // {
+            //     Log.Warn($"Can't find player with id {id}");
+            //     return;
+            // }
 
-            var playerIdentity = MySession.Static.Players.TryGetPlayerIdentity(playerId);
+            var playerIdentity = MySession.Static.Players.TryGetIdentity(id);
+
+            //var playerIdentity = MySession.Static.Players.TryGetPlayerIdentity(playerId);
             //Fuck you keen and your dickhead devs
             if (string.IsNullOrEmpty(playerIdentity.DisplayName)) return;
             MySession.Static.Factions.KickPlayerFromFaction(id);
             faction.AutoAcceptMember = false;
             faction.AcceptHumans = false;
-            if (MySession.Static.Players.IsPlayerOnline(id) && playerId.SteamId > 0)
+            var steamId = MySession.Static.Players.TryGetSteamId(id);
+            if (MySession.Static.Players.IsPlayerOnline(id) && steamId > 0)
 
             {
                 Instance.Torch.CurrentSession.Managers.GetManager<ChatManagerServer>()?.
-                    SendMessageAsOther(Instance.Torch.Config.ChatName,$"You were kicked from the NPC faction: [{faction.Tag}].",Color.Red,playerId.SteamId);
+                    SendMessageAsOther(Instance.Torch.Config.ChatName,$"You were kicked from the NPC faction: [{faction.Tag}].",Color.Red,steamId);
 
                 NetworkManager.RaiseStaticEvent(ChangeFactionSuccess,MyFactionStateChange.FactionMemberKick,faction.FactionId,faction.FactionId,id,
-                    (long) 0,new EndpointId(playerId.SteamId),null);
+                    (long) 0,new EndpointId(steamId),null);
             }
             Log.Warn($"{playerIdentity.DisplayName} was removed from {faction.Tag}");
 
@@ -174,16 +184,50 @@ namespace NpcFactionFixer
         {
             int count = 0;
             var playerIds = new List<MyIdentity>(MySession.Static.Players.GetAllIdentities());
+            Log.Warn($"Found {playerIds.Count} Identity on the server");
+            
             if (playerIds.Count == 0) return 0;
             
             foreach (var player in playerIds)
             {
                 if (player.DisplayName == null || MySession.Static.Players.IdentityIsNpc(player.IdentityId)) continue;
+                _realPlayerIds.Add(player.IdentityId);
                 IMyFaction faction = MySession.Static.Factions.TryGetPlayerFaction(player.IdentityId);
-                if (faction == null || faction.Members.ContainsKey(player.IdentityId)) continue;
+                if (faction == null) continue;
+                
+                if (faction.Tag.Equals("SPID"))
+                {
+                    KickPlayer(player.IdentityId, (MyFaction) faction);
+                    count++;
+                    continue;
+                }
+                if (faction.Members.ContainsKey(player.IdentityId)) continue;
                 KickPlayer(player.IdentityId, (MyFaction) faction);
                 count++;
             }
+            return count;
+        }
+
+        /// <summary>
+        /// Added faction check to remove real players from NPC factions
+        /// </summary>
+        /// <returns></returns>
+        private static int CleanupFaction()
+        {
+            int count = 0;
+            var factions = MySession.Static.Factions;
+
+            foreach (var (factionId, faction) in factions)
+            {
+                if (!MySession.Static.Factions.IsNpcFaction(faction.Tag) && !faction.Tag.Equals("SPID"))continue;
+                foreach (var realPlayerId in _realPlayerIds)
+                {
+                    if (!faction.Members.ContainsKey(realPlayerId)) continue;
+                    faction.KickMember(realPlayerId);
+                    count++;
+                }
+            }
+
             return count;
         }
 
